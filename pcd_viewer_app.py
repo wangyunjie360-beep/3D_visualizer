@@ -3,6 +3,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
@@ -12,7 +14,12 @@ import open3d as o3d
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Point cloud viewer with launcher")
     parser.add_argument("--viewer", action="store_true", help="Run in viewer mode")
-    parser.add_argument("--file", type=str, default=None, help="Point cloud file to open")
+    parser.add_argument(
+        "--file",
+        action="append",
+        default=[],
+        help="Point cloud file to open (can be used multiple times)",
+    )
     parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
@@ -94,23 +101,131 @@ def parse_matrix(text: str) -> np.ndarray:
     return vals.reshape(4, 4)
 
 
-def launch_viewer(file_path: Optional[str], title: str, device_pref: str) -> None:
+@dataclass
+class CameraState:
+    view: np.ndarray
+    center: np.ndarray
+    eye: np.ndarray
+    up: np.ndarray
+    fov: float
+    fov_type: int
+    near: float
+    far: float
+
+
+def view_to_lookat(view: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    inv = np.linalg.inv(view)
+    eye = inv[:3, 3]
+    forward = -inv[:3, 2]
+    center = eye + forward
+    up = inv[:3, 1]
+    return center, eye, up
+
+
+def camera_states_close(a: Optional[CameraState], b: Optional[CameraState], eps: float = 1e-5) -> bool:
+    if a is None or b is None:
+        return False
+    return np.allclose(a.view, b.view, atol=eps)
+
+
+def launch_viewer(file_paths, title: str, device_pref: str) -> None:
     from open3d.visualization import gui, rendering
 
-    class ViewerWindow:
-        def __init__(self, init_file: Optional[str]):
-            self._title = title
+    class ViewerManager:
+        def __init__(self, app: gui.Application):
+            self._app = app
             self._device, self._use_cuda, self._device_note = resolve_device(device_pref)
+            self._windows = []
+            self._last_states = {}
+            self._last_tick = 0.0
+
+        def create_window(self, init_file: Optional[str]):
+            window = ViewerWindow(self, init_file)
+            self._windows.append(window)
+            return window
+
+        def remove_window(self, window):
+            if window in self._windows:
+                self._windows.remove(window)
+            self._last_states.pop(window, None)
+
+        def tick(self) -> bool:
+            now = time.perf_counter()
+            if now - self._last_tick < 0.02:
+                return False
+            self._last_tick = now
+            return self._sync_groups()
+
+        def _sync_groups(self) -> bool:
+            updated = False
+            groups = {}
+            for window in self._windows:
+                gid = window.link_group
+                if gid > 0:
+                    groups.setdefault(gid, []).append(window)
+
+            for members in groups.values():
+                master = None
+                master_state = None
+                for window in members:
+                    state = window.get_camera_state()
+                    if state is None:
+                        continue
+                    prev = self._last_states.get(window)
+                    if prev is None or not camera_states_close(prev, state):
+                        master = window
+                        master_state = state
+                        break
+
+                if master_state is None:
+                    for window in members:
+                        state = window.get_camera_state()
+                        if state is not None:
+                            self._last_states[window] = state
+                    continue
+
+                for window in members:
+                    if window is master:
+                        self._last_states[window] = master_state
+                        continue
+                    if window.apply_camera_state(master_state):
+                        updated = True
+                    self._last_states[window] = master_state
+            return updated
+
+        def sync_from(self, source) -> bool:
+            gid = source.link_group
+            if gid <= 0:
+                return False
+            state = source.get_camera_state()
+            if state is None:
+                return False
+            updated = False
+            for window in self._windows:
+                if window is source:
+                    continue
+                if window.link_group == gid:
+                    if window.apply_camera_state(state):
+                        updated = True
+                    self._last_states[window] = state
+            self._last_states[source] = state
+            return updated
+
+    class ViewerWindow:
+        def __init__(self, manager: ViewerManager, init_file: Optional[str]):
+            self._manager = manager
             self._cloud = None
             self._cloud_name = None
-            self._axis = None
             self._axis_name = "axis"
             self._axis_transform = np.eye(4)
             self._updating = False
+            self._link_group = 0
 
             self._app = gui.Application.instance
-            self._window = self._app.create_window(f"{self._title}", 1280, 800)
+            self._window = self._app.create_window(f"{title}", 1280, 800)
             self._window.set_on_layout(self._on_layout)
+            self._window.set_on_tick_event(self._on_tick)
+            self._window.set_on_close(self._on_close)
 
             self._scene = gui.SceneWidget()
             self._scene.scene = rendering.Open3DScene(self._window.renderer)
@@ -125,12 +240,19 @@ def launch_viewer(file_path: Optional[str], title: str, device_pref: str) -> Non
             self._file_label = gui.Label("No file loaded")
             self._panel.add_child(self._file_label)
 
-            self._status_label = gui.Label(self._device_note)
+            self._points_label = gui.Label("Points: -")
+            self._panel.add_child(self._points_label)
+
+            self._status_label = gui.Label(self._manager._device_note)
             self._panel.add_child(self._status_label)
 
             open_btn = gui.Button("Open...")
             open_btn.set_on_clicked(self._on_open)
             self._panel.add_child(open_btn)
+
+            new_btn = gui.Button("Open New Window")
+            new_btn.set_on_clicked(self._on_open_new)
+            self._panel.add_child(new_btn)
 
             self._panel.add_fixed(0.5 * em)
             self._panel.add_child(gui.Label("Render Mode"))
@@ -179,12 +301,14 @@ def launch_viewer(file_path: Optional[str], title: str, device_pref: str) -> Non
             self._axis_mode.add_item("Quaternion + Translation")
             self._axis_mode.add_item("Matrix 4x4")
             self._axis_mode.selected_index = 0
+            self._axis_mode.set_on_selection_changed(self._on_axis_mode_changed)
             self._panel.add_child(self._axis_mode)
 
             self._quat_inputs = self._build_quat_inputs()
             self._panel.add_child(self._quat_inputs)
 
-            self._panel.add_child(gui.Label("Matrix 4x4 (row-major)"))
+            self._matrix_label = gui.Label("Matrix 4x4 (row-major)")
+            self._panel.add_child(self._matrix_label)
             self._matrix_edit = gui.TextEdit()
             self._matrix_edit.text_value = (
                 "1 0 0 0\n"
@@ -193,6 +317,8 @@ def launch_viewer(file_path: Optional[str], title: str, device_pref: str) -> Non
                 "0 0 0 1\n"
             )
             self._panel.add_child(self._matrix_edit)
+            self._matrix_label.visible = False
+            self._matrix_edit.visible = False
 
             apply_btn = gui.Button("Apply Axis Transform")
             apply_btn.set_on_clicked(self._on_apply_axis)
@@ -202,8 +328,26 @@ def launch_viewer(file_path: Optional[str], title: str, device_pref: str) -> Non
             reset_btn.set_on_clicked(self._on_reset_view)
             self._panel.add_child(reset_btn)
 
+            self._panel.add_fixed(0.5 * em)
+            self._panel.add_child(gui.Label("View Sync Group"))
+            self._link_combo = gui.Combobox()
+            self._link_combo.add_item("Unlocked")
+            for i in range(1, 5):
+                self._link_combo.add_item(f"Group {i}")
+            self._link_combo.selected_index = 0
+            self._link_combo.set_on_selection_changed(self._on_link_group_changed)
+            self._panel.add_child(self._link_combo)
+
+            sync_btn = gui.Button("Sync Group Now")
+            sync_btn.set_on_clicked(self._on_sync_group)
+            self._panel.add_child(sync_btn)
+
             if init_file:
                 self._load_file(init_file)
+
+        @property
+        def link_group(self) -> int:
+            return self._link_group
 
         def _build_quat_inputs(self) -> gui.Widget:
             grid = gui.VGrid(2, 0.25 * self._window.theme.font_size)
@@ -233,7 +377,7 @@ def launch_viewer(file_path: Optional[str], title: str, device_pref: str) -> Non
             grid.add_child(self._tz)
             return grid
 
-        def _on_layout(self, ctx):
+        def _on_layout(self, _ctx):
             r = self._window.content_rect
             panel_width = int(24 * self._window.theme.font_size)
             self._scene.frame = gui.Rect(r.x, r.y, r.width - panel_width, r.height)
@@ -243,6 +387,13 @@ def launch_viewer(file_path: Optional[str], title: str, device_pref: str) -> Non
 
         def _set_status(self, text: str) -> None:
             self._status_label.text = text
+
+        def _on_tick(self) -> bool:
+            return self._manager.tick()
+
+        def _on_close(self) -> bool:
+            self._manager.remove_window(self)
+            return True
 
         def _on_open(self):
             dlg = gui.FileDialog(gui.FileDialog.OPEN, "Open Point Cloud", self._window.theme)
@@ -254,21 +405,37 @@ def launch_viewer(file_path: Optional[str], title: str, device_pref: str) -> Non
             dlg.set_on_done(self._on_open_done)
             self._window.show_dialog(dlg)
 
+        def _on_open_new(self):
+            dlg = gui.FileDialog(gui.FileDialog.OPEN, "Open in New Window", self._window.theme)
+            dlg.add_filter(".ply", "PLY")
+            dlg.add_filter(".pcd", "PCD")
+            dlg.add_filter(".bin", "BIN")
+            dlg.add_filter("", "All files")
+            dlg.set_on_cancel(self._window.close_dialog)
+            dlg.set_on_done(self._on_open_new_done)
+            self._window.show_dialog(dlg)
+
         def _on_open_done(self, filename):
             self._window.close_dialog()
             if filename:
                 self._load_file(filename)
 
+        def _on_open_new_done(self, filename):
+            self._window.close_dialog()
+            if filename:
+                self._manager.create_window(filename)
+
         def _load_file(self, filename: str) -> None:
             try:
-                pcd = load_point_cloud(filename, self._use_cuda)
+                pcd = load_point_cloud(filename, self._manager._use_cuda)
             except Exception as exc:
                 self._set_status(f"Load failed: {exc}")
                 return
             self._cloud = pcd
             self._cloud_name = "cloud"
             self._file_label.text = os.path.basename(filename)
-            self._set_status(self._device_note)
+            self._points_label.text = f"Points: {len(pcd.points)}"
+            self._set_status(self._manager._device_note)
             self._rebuild_scene()
 
         def _clear_cloud(self):
@@ -320,7 +487,39 @@ def launch_viewer(file_path: Optional[str], title: str, device_pref: str) -> Non
             material.shader = "defaultUnlit"
             self._scene.scene.add_geometry(self._axis_name, axis, material)
 
-        def _on_mode_changed(self, text, _index):
+        def _camera_aspect(self) -> float:
+            frame = self._scene.frame
+            if frame.height <= 0:
+                return 1.0
+            return float(frame.width) / float(frame.height)
+
+        def get_camera_state(self) -> Optional[CameraState]:
+            if self._cloud is None:
+                return None
+            cam = self._scene.scene.camera
+            view = np.asarray(cam.get_view_matrix(), dtype=float)
+            center, eye, up = view_to_lookat(view)
+            return CameraState(
+                view=view,
+                center=center,
+                eye=eye,
+                up=up,
+                fov=cam.get_field_of_view(),
+                fov_type=cam.get_field_of_view_type(),
+                near=cam.get_near(),
+                far=cam.get_far(),
+            )
+
+        def apply_camera_state(self, state: CameraState) -> bool:
+            if self._cloud is None:
+                return False
+            cam = self._scene.scene.camera
+            cam.set_projection(state.fov, self._camera_aspect(), state.near, state.far, state.fov_type)
+            cam.look_at(state.center, state.eye, state.up)
+            self._window.post_redraw()
+            return True
+
+        def _on_mode_changed(self, _text, _index):
             self._rebuild_scene()
 
         def _on_point_size_slider(self, value):
@@ -359,8 +558,25 @@ def launch_viewer(file_path: Optional[str], title: str, device_pref: str) -> Non
             if self._mode_combo.selected_text == "Voxel":
                 self._rebuild_scene()
 
-        def _on_axis_toggle(self, is_checked):
+        def _on_axis_toggle(self, _is_checked):
             self._update_axis_geometry()
+
+        def _on_axis_mode_changed(self, text, _index):
+            is_matrix = text == "Matrix 4x4"
+            self._quat_inputs.visible = not is_matrix
+            self._matrix_label.visible = is_matrix
+            self._matrix_edit.visible = is_matrix
+
+        def _on_link_group_changed(self, _text, index):
+            self._link_group = index
+            if self._link_group == 0:
+                self._set_status("View sync: unlocked")
+            else:
+                self._set_status(f"View sync: Group {self._link_group}")
+
+        def _on_sync_group(self):
+            if self._manager.sync_from(self):
+                self._window.post_redraw()
 
         def _on_apply_axis(self):
             try:
@@ -400,25 +616,24 @@ def launch_viewer(file_path: Optional[str], title: str, device_pref: str) -> Non
 
     app = gui.Application.instance
     app.initialize()
-    ViewerWindow(file_path)
+    manager = ViewerManager(app)
+    if file_paths:
+        for path in file_paths:
+            manager.create_window(path)
+    else:
+        manager.create_window(None)
     app.run()
 
 
-def spawn_viewer(path: str, device_pref: str, title: str) -> None:
-    if getattr(sys, "frozen", False):
-        cmd = [sys.executable, "--viewer", "--file", path, "--device", device_pref, "--title", title]
-    else:
-        cmd = [
-            sys.executable,
-            os.path.abspath(__file__),
-            "--viewer",
-            "--file",
-            path,
-            "--device",
-            device_pref,
-            "--title",
-            title,
-        ]
+def spawn_viewer(paths, device_pref: str, title: str) -> None:
+    if isinstance(paths, str):
+        paths = [paths]
+    cmd = [sys.executable]
+    if not getattr(sys, "frozen", False):
+        cmd.append(os.path.abspath(__file__))
+    cmd += ["--viewer", "--device", device_pref, "--title", title]
+    for path in paths:
+        cmd += ["--file", path]
     subprocess.Popen(cmd, close_fds=False)
 
 
@@ -447,19 +662,19 @@ def launch_launcher(device_pref: str, title: str) -> None:
                 ("All Files", "*.*"),
             ]
         )
-        for p in paths:
-            add_file(p)
+        if paths:
+            add_files(list(paths))
 
-    def add_file(path: str):
-        if not path:
+    def add_files(paths):
+        if not paths:
             return
-        listbox.insert(tk.END, path)
-        spawn_viewer(path, device_pref, title)
+        for path in paths:
+            listbox.insert(tk.END, path)
+        spawn_viewer(paths, device_pref, title)
 
     def on_drop(event):
         files = root.tk.splitlist(event.data)
-        for f in files:
-            add_file(f)
+        add_files(list(files))
 
     btn = tk.Button(root, text="Open Files...", command=open_files)
     btn.pack(padx=10, pady=6)
