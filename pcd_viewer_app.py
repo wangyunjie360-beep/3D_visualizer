@@ -4,10 +4,20 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional, Tuple
 
 import numpy as np
 import open3d as o3d
+
+
+@dataclass
+class AssetPart:
+    path: str
+    geometry: object
+    preferred_mode: str
+    category: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -115,6 +125,44 @@ def load_asset(path: str, use_cuda: bool):
     raise ValueError(f"Unsupported file type: {ext}")
 
 
+def load_asset_parts(path: str, use_cuda: bool) -> list[AssetPart]:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in {".glb", ".gltf"} and hasattr(o3d.io, "read_triangle_model"):
+        model = o3d.io.read_triangle_model(path)
+        mesh_infos = list(getattr(model, "meshes", []))
+        if len(mesh_infos) == 1:
+            mesh_info = mesh_infos[0]
+            mesh, preferred_mode = load_asset(path, use_cuda)
+            name = getattr(mesh_info, "mesh_name", "") or os.path.splitext(
+                os.path.basename(path)
+            )[0]
+            return [AssetPart(path, mesh, preferred_mode, name)]
+        parts = []
+        for idx, mesh_info in enumerate(mesh_infos, start=1):
+            mesh = getattr(mesh_info, "mesh", None)
+            if mesh is None or mesh.is_empty():
+                continue
+            if len(mesh.triangles) > 0 and not mesh.has_vertex_normals():
+                mesh.compute_vertex_normals()
+            name = getattr(mesh_info, "mesh_name", "") or f"mesh_{idx}"
+            parts.append(AssetPart(path, mesh, "Mesh", name))
+        if parts:
+            return parts
+
+    geometry, preferred_mode = load_asset(path, use_cuda)
+    category = preferred_mode if preferred_mode != "Mesh" else os.path.splitext(os.path.basename(path))[0]
+    return [AssetPart(path, geometry, preferred_mode, category)]
+
+
+def default_screenshot_path(directory: str, timestamp: Optional[str] = None) -> str:
+    stamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(directory, f"render_{stamp}.png")
+
+
+def missing_category_widgets(categories: list[str], existing_categories) -> list[str]:
+    return [category for category in categories if category not in existing_categories]
+
+
 def clone_geometry(geometry):
     point_cloud_type = getattr(o3d.geometry, "PointCloud", None)
     triangle_mesh_type = getattr(o3d.geometry, "TriangleMesh", None)
@@ -206,8 +254,14 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
     class ViewerWindow:
         def __init__(self, init_files):
             self._device, self._use_cuda, self._device_note = resolve_device(device_pref)
+            self._parts = []
             self._clouds = []
             self._preferred_modes = []
+            self._categories = []
+            self._visible_categories = set()
+            self._category_checkboxes = {}
+            self._screenshot_was_pending = False
+            self._screenshot_original_backgrounds = []
             self._paths = []
             self._panes = []
             self._axis_transform = np.eye(4)
@@ -314,6 +368,15 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
             self._panel.add_child(self._voxel_edit)
 
             self._panel.add_fixed(0.5 * em)
+            self._panel.add_child(gui.Label("Categories"))
+            self._category_list = gui.Vert(0, gui.Margins(0, 0, 0, 0))
+            self._panel.add_child(self._category_list)
+
+            screenshot_btn = gui.Button("Screenshot PNG")
+            screenshot_btn.set_on_clicked(self._on_screenshot)
+            self._panel.add_child(screenshot_btn)
+
+            self._panel.add_fixed(0.5 * em)
             self._show_axis = gui.Checkbox("Show Axis")
             self._show_axis.checked = True
             self._show_axis.set_on_checked(self._on_axis_toggle)
@@ -400,6 +463,7 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
                     {
                         "widget": widget,
                         "scene": widget.scene,
+                        "background": [0, 0, 0, 1],
                         "cloud_names": [],
                         "axis_name": f"axis_{len(self._panes)}",
                     }
@@ -488,11 +552,75 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
                 return
             self._file_label.text = f"Files: {len(self._paths)}"
             lines = []
-            for idx, (path, cloud) in enumerate(zip(self._paths, self._clouds), start=1):
+            for idx, part in enumerate(self._parts, start=1):
                 lines.append(
-                    f"{idx}. {os.path.basename(path)} - {geometry_point_count(cloud)} items"
+                    f"{idx}. {os.path.basename(part.path)} [{part.category}] - {geometry_point_count(part.geometry)} items"
                 )
             self._points_label.text = "\n".join(lines)
+
+        def _refresh_category_list(self):
+            for category in missing_category_widgets(
+                self._categories, self._category_checkboxes
+            ):
+                checkbox = gui.Checkbox(category)
+                checkbox.checked = category in self._visible_categories
+                checkbox.set_on_checked(
+                    lambda is_checked, category=category: self._on_category_checked(
+                        category, is_checked
+                    )
+                )
+                self._category_checkboxes[category] = checkbox
+                self._category_list.add_child(checkbox)
+            for category, checkbox in self._category_checkboxes.items():
+                checkbox.checked = category in self._visible_categories
+
+        def _on_category_checked(self, category: str, is_checked: bool):
+            if is_checked:
+                self._visible_categories.add(category)
+            else:
+                self._visible_categories.discard(category)
+            self._rebuild_scene()
+
+        def _on_screenshot(self):
+            if not self._panes:
+                self._set_status("Screenshot failed: no scene")
+                return
+            path = default_screenshot_path(os.getcwd())
+            try:
+                self._screenshot_original_backgrounds = []
+                for pane in self._panes[: self._pane_count]:
+                    self._screenshot_original_backgrounds.append(pane["background"])
+                    pane["background"] = [1, 1, 1, 1]
+                    pane["scene"].set_background(pane["background"])
+                self._screenshot_was_pending = True
+                self._app.render_to_image(self._on_screenshot_done(path))
+            except Exception as exc:
+                self._restore_screenshot_backgrounds()
+                self._set_status(f"Screenshot failed: {exc}")
+
+        def _on_screenshot_done(self, path: str):
+            def save_image(image):
+                try:
+                    o3d.io.write_image(path, image, 9)
+                    self._set_status(f"Screenshot saved: {path}")
+                except Exception as exc:
+                    self._set_status(f"Screenshot failed: {exc}")
+                finally:
+                    self._restore_screenshot_backgrounds()
+
+            return save_image
+
+        def _restore_screenshot_backgrounds(self):
+            if not self._screenshot_was_pending:
+                return
+            for pane, background in zip(
+                self._panes[: self._pane_count], self._screenshot_original_backgrounds
+            ):
+                pane["background"] = background
+                pane["scene"].set_background(background)
+            self._screenshot_was_pending = False
+            self._screenshot_original_backgrounds = []
+            self._window.post_redraw()
 
         def _on_open(self):
             dlg = gui.FileDialog(gui.FileDialog.OPEN, "Open 3D File", self._window.theme)
@@ -517,16 +645,22 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
 
         def _add_file(self, filename: str, rebuild: bool) -> None:
             try:
-                asset, preferred_mode = load_asset(filename, self._use_cuda)
+                parts = load_asset_parts(filename, self._use_cuda)
             except Exception as exc:
                 self._set_status(f"Load failed: {exc}")
                 return
-            self._clouds.append(asset)
-            self._preferred_modes.append(preferred_mode)
+            for part in parts:
+                self._parts.append(part)
+                self._clouds.append(part.geometry)
+                self._preferred_modes.append(part.preferred_mode)
+                if part.category not in self._categories:
+                    self._categories.append(part.category)
+                    self._visible_categories.add(part.category)
             self._paths.append(filename)
             self._pane_count = max(1, self._pane_count)
             self._pane_count_edit.int_value = self._pane_count
             self._update_file_labels()
+            self._refresh_category_list()
             self._set_status(self._device_note)
             if rebuild:
                 self._apply_layout(rebuild=True)
@@ -543,10 +677,15 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
         def _rebuild_scene(self):
             for pane in self._panes:
                 self._clear_pane(pane)
-            if not self._clouds:
+            visible_indices = [
+                idx
+                for idx, part in enumerate(self._parts)
+                if part.category in self._visible_categories
+            ]
+            if not visible_indices:
                 return
 
-            groups = split_clouds(list(range(len(self._clouds))), self._pane_count)
+            groups = split_clouds(visible_indices, self._pane_count)
             mode = self._mode_combo.selected_text
 
             for pane_idx, pane in enumerate(self._panes[: self._pane_count]):

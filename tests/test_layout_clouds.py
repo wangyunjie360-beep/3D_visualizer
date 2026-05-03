@@ -70,7 +70,21 @@ class _FakeTriangleMesh:
         return cloud
 
 
+def _fake_mesh(vertices):
+    mesh = _FakeTriangleMesh()
+    mesh.vertices = np.asarray(vertices, dtype=float)
+    mesh.triangles = np.array([[0, 1, 2]], dtype=int)
+    return mesh
+
+
 def _install_fake_open3d():
+    compact_mesh = _fake_mesh([[9, 0, 0], [9, 1, 0], [9, 0, 1]])
+    fake_mesh_model = types.SimpleNamespace(
+        meshes=[
+            types.SimpleNamespace(mesh=_fake_mesh([[0, 0, 0], [1, 0, 0], [0, 1, 0]]), mesh_name="car"),
+            types.SimpleNamespace(mesh=_fake_mesh([[0, 0, 1], [1, 0, 1], [0, 1, 1]]), mesh_name="road"),
+        ]
+    )
     fake_module = types.ModuleType("open3d")
     fake_module.geometry = types.SimpleNamespace(
         PointCloud=_FakePointCloud,
@@ -81,13 +95,22 @@ def _install_fake_open3d():
     fake_module.utility = types.SimpleNamespace(
         Vector3dVector=lambda values: np.asarray(values, dtype=float)
     )
-    fake_module.t = types.SimpleNamespace(io=types.SimpleNamespace(read_triangle_mesh=lambda path: _FakeTriangleMesh()))
+    fake_module.io = types.SimpleNamespace(
+        read_triangle_model=lambda path: types.SimpleNamespace(
+            meshes=[types.SimpleNamespace(mesh=_fake_mesh([[0, 0, 0]] * 6), mesh_name="single")]
+        )
+        if "single" in path
+        else fake_mesh_model,
+        read_triangle_mesh=lambda path: compact_mesh,
+    )
+    fake_module.t = types.SimpleNamespace(io=types.SimpleNamespace(read_triangle_mesh=lambda path: compact_mesh))
     sys.modules["open3d"] = fake_module
 
 
 _install_fake_open3d()
-layout_clouds = importlib.import_module("pcd_viewer_app").layout_clouds
-preferred_render_mode_for_path = importlib.import_module("pcd_viewer_app").preferred_render_mode_for_path
+app_module = importlib.import_module("pcd_viewer_app")
+layout_clouds = app_module.layout_clouds
+preferred_render_mode_for_path = app_module.preferred_render_mode_for_path
 
 
 class LayoutCloudsTests(unittest.TestCase):
@@ -111,6 +134,28 @@ class LayoutCloudsTests(unittest.TestCase):
         self.assertEqual(preferred_render_mode_for_path("foo.glb"), "Mesh")
         self.assertEqual(preferred_render_mode_for_path("foo.gltf"), "Mesh")
         self.assertEqual(preferred_render_mode_for_path("foo.ply"), "Points")
+
+    def test_load_glb_returns_named_category_parts(self):
+        parts = app_module.load_asset_parts("scene.glb", use_cuda=False)
+
+        self.assertEqual([part.category for part in parts], ["car", "road"])
+        self.assertTrue(all(part.preferred_mode == "Mesh" for part in parts))
+
+    def test_single_mesh_glb_uses_compact_mesh_reader(self):
+        parts = app_module.load_asset_parts("single.glb", use_cuda=False)
+
+        self.assertEqual([part.category for part in parts], ["single"])
+        self.assertEqual(len(parts[0].geometry.vertices), 3)
+
+    def test_screenshot_path_uses_png_extension(self):
+        path = app_module.default_screenshot_path("/tmp/out", "20260503_120000")
+
+        self.assertTrue(path.endswith("render_20260503_120000.png"))
+
+    def test_missing_category_widgets_only_returns_new_categories(self):
+        missing = app_module.missing_category_widgets(["car", "road", "tree"], {"road"})
+
+        self.assertEqual(missing, ["car", "tree"])
 
 
 if __name__ == "__main__":

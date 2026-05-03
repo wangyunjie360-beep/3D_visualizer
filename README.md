@@ -7,6 +7,8 @@ Open3D-based 3D point cloud visualizer with a single-window multi-pane layout an
 - Each pane can contain one or multiple point clouds; files are distributed across panes.
 - Supports **Points / Voxel** rendering modes with adjustable sizes.
 - Auto-detects the best display mode from the file suffix, including **GLB/GLTF mesh** files.
+- Category checkboxes let you show/hide GLB/GLTF sub-mesh categories; all categories are visible by default.
+- Screenshot button exports the current rendered view as a white-background PNG.
 - Optional coordinate axis display with quaternion or 4x4 matrix transform.
 - Optional **Preserve Coordinates** mode so the displayed origin stays aligned with the original camera frame.
 - Shows **point count** for each loaded file.
@@ -38,6 +40,8 @@ python pcd_viewer_app.py --viewer --file A.ply --file B.glb --file C.bin
 ## UI Notes
 - **Auto layout**: set number of panes and the grid is chosen automatically.
 - **Manual layout**: disable Auto layout and set rows/cols.
+- **Categories**: uncheck categories to hide them from the current render.
+- **Screenshot PNG**: saves the current view to `render_YYYYMMDD_HHMMSS.png` in the current working directory.
 - **Preserve Coordinates**: keep the point cloud in its original frame so the axis origin remains the camera origin.
 - **Hide panel**: click "Hide Panel (H)" or press **H**.
 
