@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 import re
 import subprocess
@@ -71,23 +72,70 @@ def load_bin_as_pcd(path: str) -> o3d.geometry.PointCloud:
     return pcd
 
 
-def load_point_cloud(path: str, use_cuda: bool) -> o3d.geometry.PointCloud:
+def preferred_render_mode_for_path(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in {".glb", ".gltf"}:
+        return "Mesh"
+    if ext in {".bin", ".pcd", ".ply"}:
+        return "Points"
+    raise ValueError(f"Unsupported file type: {ext}")
+
+
+def load_asset(path: str, use_cuda: bool):
     ext = os.path.splitext(path)[1].lower()
     if ext == ".bin":
-        return load_bin_as_pcd(path)
+        return load_bin_as_pcd(path), preferred_render_mode_for_path(path)
     if ext in {".pcd", ".ply"}:
         if use_cuda:
             try:
                 device = o3d.core.Device("CUDA:0")
                 tpcd = o3d.t.io.read_point_cloud(path, device=device)
-                return tpcd.to_legacy()
+                pcd = tpcd.to_legacy()
             except Exception:
-                pass
-        pcd = o3d.io.read_point_cloud(path)
+                pcd = o3d.io.read_point_cloud(path)
+        else:
+            pcd = o3d.io.read_point_cloud(path)
         if pcd.is_empty():
             raise ValueError(f"{os.path.basename(path)}: loaded empty point cloud.")
-        return pcd
+        return pcd, preferred_render_mode_for_path(path)
+    if ext in {".glb", ".gltf"}:
+        mesh = None
+        tensor_reader = getattr(getattr(o3d, "t", None), "io", None)
+        if tensor_reader is not None and hasattr(tensor_reader, "read_triangle_mesh"):
+            mesh = tensor_reader.read_triangle_mesh(path)
+            if hasattr(mesh, "to_legacy"):
+                mesh = mesh.to_legacy()
+        if mesh is None:
+            mesh = o3d.io.read_triangle_mesh(path)
+        if mesh.is_empty():
+            raise ValueError(f"{os.path.basename(path)}: loaded empty triangle mesh.")
+        if len(mesh.triangles) > 0 and not mesh.has_vertex_normals():
+            mesh.compute_vertex_normals()
+        return mesh, preferred_render_mode_for_path(path)
     raise ValueError(f"Unsupported file type: {ext}")
+
+
+def clone_geometry(geometry):
+    point_cloud_type = getattr(o3d.geometry, "PointCloud", None)
+    triangle_mesh_type = getattr(o3d.geometry, "TriangleMesh", None)
+    if point_cloud_type is not None and isinstance(geometry, point_cloud_type):
+        return point_cloud_type(geometry)
+    if triangle_mesh_type is not None and isinstance(geometry, triangle_mesh_type):
+        return triangle_mesh_type(geometry)
+    return copy.deepcopy(geometry)
+
+
+def geometry_point_count(geometry) -> int:
+    point_cloud_type = getattr(o3d.geometry, "PointCloud", None)
+    triangle_mesh_type = getattr(o3d.geometry, "TriangleMesh", None)
+    voxel_grid_type = getattr(o3d.geometry, "VoxelGrid", None)
+    if point_cloud_type is not None and isinstance(geometry, point_cloud_type):
+        return len(geometry.points)
+    if triangle_mesh_type is not None and isinstance(geometry, triangle_mesh_type):
+        return len(geometry.vertices)
+    if voxel_grid_type is not None and isinstance(geometry, voxel_grid_type):
+        return len(geometry.get_voxels())
+    return 0
 
 
 def parse_matrix(text: str) -> np.ndarray:
@@ -99,9 +147,11 @@ def parse_matrix(text: str) -> np.ndarray:
     return vals.reshape(4, 4)
 
 
-def layout_clouds(clouds, gap: float) -> list:
+def layout_clouds(clouds, gap: float, preserve_coordinates: bool = False) -> list:
     if not clouds:
         return []
+    if preserve_coordinates:
+        return [clone_geometry(cloud) for cloud in clouds]
     extents = [c.get_axis_aligned_bounding_box().get_extent() for c in clouds]
     max_x = max(e[0] for e in extents) if extents else 1.0
     max_y = max(e[1] for e in extents) if extents else 1.0
@@ -118,7 +168,7 @@ def layout_clouds(clouds, gap: float) -> list:
         col = idx % cols
         offset_x = (col - (cols - 1) / 2.0) * step_x
         offset_y = ((rows - 1) / 2.0 - row) * step_y
-        copy_cloud = o3d.geometry.PointCloud(cloud)
+        copy_cloud = clone_geometry(cloud)
         copy_cloud.translate(-copy_cloud.get_center())
         copy_cloud.translate([offset_x, offset_y, 0.0])
         positioned.append(copy_cloud)
@@ -157,11 +207,13 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
         def __init__(self, init_files):
             self._device, self._use_cuda, self._device_note = resolve_device(device_pref)
             self._clouds = []
+            self._preferred_modes = []
             self._paths = []
             self._panes = []
             self._axis_transform = np.eye(4)
             self._updating = False
             self._gap = 1.0
+            self._preserve_coordinates = True
 
             self._pane_count = max(1, len(init_files) if init_files else 1)
             self._auto_layout = True
@@ -227,8 +279,10 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
             self._panel.add_fixed(0.5 * em)
             self._panel.add_child(gui.Label("Render Mode"))
             self._mode_combo = gui.Combobox()
+            self._mode_combo.add_item("Auto")
             self._mode_combo.add_item("Points")
             self._mode_combo.add_item("Voxel")
+            self._mode_combo.add_item("Mesh")
             self._mode_combo.selected_index = 0
             self._mode_combo.set_on_selection_changed(self._on_mode_changed)
             self._panel.add_child(self._mode_combo)
@@ -264,6 +318,11 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
             self._show_axis.checked = True
             self._show_axis.set_on_checked(self._on_axis_toggle)
             self._panel.add_child(self._show_axis)
+
+            self._preserve_coords_cb = gui.Checkbox("Preserve Coordinates")
+            self._preserve_coords_cb.checked = self._preserve_coordinates
+            self._preserve_coords_cb.set_on_checked(self._on_preserve_coordinates)
+            self._panel.add_child(self._preserve_coords_cb)
 
             self._panel.add_fixed(0.5 * em)
             self._panel.add_child(gui.Label("Axis Input Mode"))
@@ -430,14 +489,18 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
             self._file_label.text = f"Files: {len(self._paths)}"
             lines = []
             for idx, (path, cloud) in enumerate(zip(self._paths, self._clouds), start=1):
-                lines.append(f"{idx}. {os.path.basename(path)} - {len(cloud.points)} pts")
+                lines.append(
+                    f"{idx}. {os.path.basename(path)} - {geometry_point_count(cloud)} items"
+                )
             self._points_label.text = "\n".join(lines)
 
         def _on_open(self):
-            dlg = gui.FileDialog(gui.FileDialog.OPEN, "Open Point Cloud", self._window.theme)
+            dlg = gui.FileDialog(gui.FileDialog.OPEN, "Open 3D File", self._window.theme)
             dlg.add_filter(".ply", "PLY")
             dlg.add_filter(".pcd", "PCD")
             dlg.add_filter(".bin", "BIN")
+            dlg.add_filter(".glb", "GLB")
+            dlg.add_filter(".gltf", "GLTF")
             dlg.add_filter("", "All files")
             if self._paths:
                 dlg.set_path(os.path.dirname(self._paths[-1]))
@@ -454,11 +517,12 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
 
         def _add_file(self, filename: str, rebuild: bool) -> None:
             try:
-                pcd = load_point_cloud(filename, self._use_cuda)
+                asset, preferred_mode = load_asset(filename, self._use_cuda)
             except Exception as exc:
                 self._set_status(f"Load failed: {exc}")
                 return
-            self._clouds.append(pcd)
+            self._clouds.append(asset)
+            self._preferred_modes.append(preferred_mode)
             self._paths.append(filename)
             self._pane_count = max(1, self._pane_count)
             self._pane_count_edit.int_value = self._pane_count
@@ -482,16 +546,23 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
             if not self._clouds:
                 return
 
-            groups = split_clouds(self._clouds, self._pane_count)
+            groups = split_clouds(list(range(len(self._clouds))), self._pane_count)
             mode = self._mode_combo.selected_text
 
             for pane_idx, pane in enumerate(self._panes[: self._pane_count]):
-                group = groups[pane_idx] if pane_idx < len(groups) else []
-                if not group:
+                index_group = groups[pane_idx] if pane_idx < len(groups) else []
+                if not index_group:
                     continue
-                positioned = layout_clouds(group, self._gap)
+                group = [self._clouds[index_] for index_ in index_group]
+                positioned = layout_clouds(
+                    group,
+                    self._gap,
+                    preserve_coordinates=self._preserve_coordinates,
+                )
                 for idx, cloud in enumerate(positioned):
-                    if mode == "Voxel":
+                    preferred_mode = self._preferred_modes[index_group[idx]]
+                    active_mode = preferred_mode if mode == "Auto" else mode
+                    if active_mode == "Voxel" and isinstance(cloud, o3d.geometry.PointCloud):
                         voxel_size = float(self._voxel_edit.double_value)
                         if voxel_size <= 0:
                             self._set_status("Voxel size must be > 0")
@@ -499,12 +570,18 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
                         geom = o3d.geometry.VoxelGrid.create_from_point_cloud(
                             cloud, voxel_size=voxel_size
                         )
+                    elif active_mode == "Points" and isinstance(cloud, o3d.geometry.TriangleMesh):
+                        geom = cloud.sample_points_uniformly(
+                            number_of_points=max(2048, len(cloud.triangles) * 10)
+                        )
+                    elif active_mode == "Mesh" and isinstance(cloud, o3d.geometry.PointCloud):
+                        geom = cloud
                     else:
                         geom = cloud
 
                     material = rendering.MaterialRecord()
-                    material.shader = "defaultUnlit"
-                    if mode == "Points":
+                    material.shader = "defaultLit" if isinstance(geom, o3d.geometry.TriangleMesh) else "defaultUnlit"
+                    if active_mode == "Points":
                         material.point_size = float(self._point_edit.double_value)
                     name = f"cloud_{pane_idx}_{idx}"
                     pane["cloud_names"].append(name)
@@ -530,7 +607,7 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
             self._updating = True
             self._point_edit.double_value = value
             self._updating = False
-            if self._mode_combo.selected_text == "Points":
+            if self._mode_combo.selected_text in {"Points", "Auto"}:
                 self._rebuild_scene()
 
         def _on_point_size_edit(self, value):
@@ -539,7 +616,7 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
             self._updating = True
             self._point_slider.double_value = value
             self._updating = False
-            if self._mode_combo.selected_text == "Points":
+            if self._mode_combo.selected_text in {"Points", "Auto"}:
                 self._rebuild_scene()
 
         def _on_voxel_size_slider(self, value):
@@ -548,7 +625,7 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
             self._updating = True
             self._voxel_edit.double_value = value
             self._updating = False
-            if self._mode_combo.selected_text == "Voxel":
+            if self._mode_combo.selected_text in {"Voxel", "Auto"}:
                 self._rebuild_scene()
 
         def _on_voxel_size_edit(self, value):
@@ -557,10 +634,14 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
             self._updating = True
             self._voxel_slider.double_value = value
             self._updating = False
-            if self._mode_combo.selected_text == "Voxel":
+            if self._mode_combo.selected_text in {"Voxel", "Auto"}:
                 self._rebuild_scene()
 
         def _on_axis_toggle(self, _is_checked):
+            self._rebuild_scene()
+
+        def _on_preserve_coordinates(self, is_checked):
+            self._preserve_coordinates = bool(is_checked)
             self._rebuild_scene()
 
         def _on_axis_mode_changed(self, text, _index):
@@ -656,7 +737,7 @@ def launch_launcher(device_pref: str, title: str) -> None:
     root.title(f"{title} Launcher")
     root.geometry("520x320")
 
-    info = tk.Label(root, text="Drag and drop .ply/.pcd/.bin files here, or click Open Files...")
+    info = tk.Label(root, text="Drag and drop .ply/.pcd/.bin/.glb/.gltf files here, or click Open Files...")
     info.pack(padx=10, pady=10)
 
     listbox = tk.Listbox(root, width=80, height=10)
@@ -665,7 +746,7 @@ def launch_launcher(device_pref: str, title: str) -> None:
     def open_files():
         paths = filedialog.askopenfilenames(
             filetypes=[
-                ("Point Clouds", "*.ply *.pcd *.bin"),
+                ("3D Files", "*.ply *.pcd *.bin *.glb *.gltf"),
                 ("All Files", "*.*"),
             ]
         )
