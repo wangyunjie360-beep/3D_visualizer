@@ -93,7 +93,8 @@ def _install_fake_open3d():
         AxisAlignedBoundingBox=_FakeBoundingBox,
     )
     fake_module.utility = types.SimpleNamespace(
-        Vector3dVector=lambda values: np.asarray(values, dtype=float)
+        Vector3dVector=lambda values: np.asarray(values, dtype=float),
+        Vector3iVector=lambda values: np.asarray(values, dtype=int),
     )
     fake_module.io = types.SimpleNamespace(
         read_triangle_model=lambda path: types.SimpleNamespace(
@@ -156,6 +157,52 @@ class LayoutCloudsTests(unittest.TestCase):
         missing = app_module.missing_category_widgets(["car", "road", "tree"], {"road"})
 
         self.assertEqual(missing, ["car", "tree"])
+
+    def test_parse_ply_semantic_color_map(self):
+        header = [
+            "ply\n",
+            "comment class 0: floor rgb=[230, 25, 75]\n",
+            "comment class 1: wall rgb=[60, 180, 75]\n",
+            "end_header\n",
+        ]
+
+        mapping = app_module.parse_ply_semantic_color_map(header)
+
+        self.assertEqual(mapping[(230, 25, 75)], "floor")
+        self.assertEqual(mapping[(60, 180, 75)], "wall")
+
+    def test_triangle_mesh_splits_by_vertex_color_names(self):
+        mesh = _FakeTriangleMesh()
+        mesh.vertices = np.array(
+            [
+                [0, 0, 0],
+                [1, 0, 0],
+                [0, 1, 0],
+                [0, 0, 1],
+                [1, 0, 1],
+                [0, 1, 1],
+            ],
+            dtype=float,
+        )
+        mesh.triangles = np.array([[0, 1, 2], [3, 4, 5]], dtype=int)
+        mesh.vertex_colors = np.array(
+            [
+                [230 / 255, 25 / 255, 75 / 255],
+                [230 / 255, 25 / 255, 75 / 255],
+                [230 / 255, 25 / 255, 75 / 255],
+                [60 / 255, 180 / 255, 75 / 255],
+                [60 / 255, 180 / 255, 75 / 255],
+                [60 / 255, 180 / 255, 75 / 255],
+            ],
+            dtype=float,
+        )
+
+        parts = app_module.split_mesh_by_vertex_color(
+            "scene.glb", mesh, {(230, 25, 75): "floor", (60, 180, 75): "wall"}
+        )
+
+        self.assertEqual([part.category for part in parts], ["floor", "wall"])
+        self.assertEqual([len(part.geometry.triangles) for part in parts], [1, 1])
 
 
 if __name__ == "__main__":
