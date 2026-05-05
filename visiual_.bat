@@ -1,1 +1,2 @@
-conda run -n wyj python pcd_viewer_app.py --device cuda
+@echo off
+call "%~dp0start_3d_visualizer.bat" %*

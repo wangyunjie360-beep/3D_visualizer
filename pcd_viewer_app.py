@@ -164,6 +164,48 @@ def default_screenshot_path(directory: str, timestamp: Optional[str] = None) -> 
     return os.path.join(directory, f"render_{stamp}.png")
 
 
+def screenshot_render_size(width: int, height: int, scale: float = 1.0) -> Tuple[int, int]:
+    scale = max(1.0, float(scale))
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
+
+def render_scene_image(app, scene, width: int, height: int, scale: float = 1.0):
+    render_width, render_height = screenshot_render_size(width, height, scale)
+    return app.render_to_image(scene, render_width, render_height)
+
+
+def image_to_uint8_array(image) -> np.ndarray:
+    image_array = np.asarray(image)
+    if image_array.ndim == 2:
+        image_array = np.repeat(image_array[:, :, np.newaxis], 3, axis=2)
+    if image_array.shape[2] > 3:
+        image_array = image_array[:, :, :3]
+    if image_array.dtype != np.uint8:
+        image_array = np.clip(image_array, 0, 255).astype(np.uint8)
+    return image_array
+
+
+def stitch_screenshot_arrays(images, rows: int, cols: int) -> np.ndarray:
+    if not images:
+        raise ValueError("no screenshot images to stitch")
+    rows = max(1, int(rows))
+    cols = max(1, int(cols))
+    arrays = [image_to_uint8_array(image) for image in images]
+    cell_height = max(array.shape[0] for array in arrays)
+    cell_width = max(array.shape[1] for array in arrays)
+    channels = arrays[0].shape[2]
+    stitched = np.full(
+        (rows * cell_height, cols * cell_width, channels), 255, dtype=np.uint8
+    )
+    for idx, array in enumerate(arrays[: rows * cols]):
+        row = idx // cols
+        col = idx % cols
+        y = row * cell_height
+        x = col * cell_width
+        stitched[y : y + array.shape[0], x : x + array.shape[1], : array.shape[2]] = array
+    return stitched
+
+
 def missing_category_widgets(categories: list[str], existing_categories) -> list[str]:
     return [category for category in categories if category not in existing_categories]
 
@@ -345,6 +387,79 @@ def combined_bbox(clouds) -> Optional[o3d.geometry.AxisAlignedBoundingBox]:
     return o3d.geometry.AxisAlignedBoundingBox(min_bound, max_bound)
 
 
+def create_camera_axis_marker(size: float = 1.0):
+    depth = float(size)
+    half_width = depth * 0.35
+    half_height = depth * 0.25
+    points = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [depth, -half_width, -half_height],
+            [depth, half_width, -half_height],
+            [depth, half_width, half_height],
+            [depth, -half_width, half_height],
+        ],
+        dtype=float,
+    )
+    lines = np.asarray(
+        [
+            [0, 1],
+            [0, 2],
+            [0, 3],
+            [0, 4],
+            [1, 2],
+            [2, 3],
+            [3, 4],
+            [4, 1],
+        ],
+        dtype=int,
+    )
+    marker = o3d.geometry.LineSet()
+    marker.points = o3d.utility.Vector3dVector(points)
+    marker.lines = o3d.utility.Vector2iVector(lines)
+    marker.colors = o3d.utility.Vector3dVector(
+        np.asarray(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.45, 1.0],
+                [1.0, 0.85, 0.0],
+                [1.0, 0.0, 1.0],
+                [0.0, 1.0, 1.0],
+                [1.0, 0.55, 0.0],
+                [0.8, 0.8, 0.8],
+            ],
+            dtype=float,
+        )
+    )
+    return marker
+
+
+def create_axis_marker(style: str, size: float = 1.0, transform=None):
+    if style == "Camera":
+        marker = create_camera_axis_marker(size)
+    else:
+        marker = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=size, origin=[0, 0, 0]
+        )
+    if transform is not None:
+        marker.transform(transform)
+    return marker
+
+
+def clamp_camera_line_width(value: float) -> float:
+    return min(12.0, max(1.0, float(value)))
+
+
+def configure_axis_marker_material(material, style: str, line_width: float = 5.0):
+    if style == "Camera":
+        material.shader = "unlitLine"
+        material.line_width = clamp_camera_line_width(line_width)
+    else:
+        material.shader = "defaultUnlit"
+    return material
+
+
 def split_clouds(clouds, pane_count: int) -> list:
     groups = [[] for _ in range(max(pane_count, 0))]
     if pane_count <= 0 or not clouds:
@@ -376,6 +491,8 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
             self._updating = False
             self._gap = 1.0
             self._preserve_coordinates = True
+            self._screenshot_scale = 2.0
+            self._camera_line_width = 5.0
 
             self._pane_count = max(1, len(init_files) if init_files else 1)
             self._auto_layout = True
@@ -483,12 +600,35 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
             screenshot_btn = gui.Button("Screenshot PNG")
             screenshot_btn.set_on_clicked(self._on_screenshot)
             self._panel.add_child(screenshot_btn)
+            self._panel.add_child(gui.Label("Screenshot Scale"))
+            self._screenshot_scale_edit = gui.NumberEdit(gui.NumberEdit.DOUBLE)
+            self._screenshot_scale_edit.double_value = self._screenshot_scale
+            self._screenshot_scale_edit.set_limits(1.0, 4.0)
+            self._screenshot_scale_edit.set_on_value_changed(self._on_screenshot_scale)
+            self._panel.add_child(self._screenshot_scale_edit)
 
             self._panel.add_fixed(0.5 * em)
             self._show_axis = gui.Checkbox("Show Axis")
             self._show_axis.checked = True
             self._show_axis.set_on_checked(self._on_axis_toggle)
             self._panel.add_child(self._show_axis)
+
+            self._panel.add_child(gui.Label("Axis Style"))
+            self._axis_style = gui.Combobox()
+            self._axis_style.add_item("Axis")
+            self._axis_style.add_item("Camera")
+            self._axis_style.selected_index = 0
+            self._axis_style.set_on_selection_changed(self._on_axis_style_changed)
+            self._panel.add_child(self._axis_style)
+
+            self._panel.add_child(gui.Label("Camera Line Width"))
+            self._camera_line_width_slider = gui.Slider(gui.Slider.DOUBLE)
+            self._camera_line_width_slider.double_value = self._camera_line_width
+            self._camera_line_width_slider.set_limits(1.0, 12.0)
+            self._camera_line_width_slider.set_on_value_changed(
+                self._on_camera_line_width
+            )
+            self._panel.add_child(self._camera_line_width_slider)
 
             self._preserve_coords_cb = gui.Checkbox("Preserve Coordinates")
             self._preserve_coords_cb.checked = self._preserve_coordinates
@@ -701,22 +841,34 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
                     pane["background"] = [1, 1, 1, 1]
                     pane["scene"].set_background(pane["background"])
                 self._screenshot_was_pending = True
-                self._app.render_to_image(self._on_screenshot_done(path))
+
+                images = []
+                for pane in self._panes[: self._pane_count]:
+                    frame = pane["widget"].frame
+                    images.append(
+                        render_scene_image(
+                            self._app,
+                            pane["scene"],
+                            frame.width,
+                            frame.height,
+                            self._screenshot_scale,
+                        )
+                    )
+                stitched = stitch_screenshot_arrays(
+                    images, self._layout_rows, self._layout_cols
+                )
+                if not o3d.io.write_image(path, o3d.geometry.Image(stitched), 9):
+                    raise RuntimeError("Open3D failed to write image")
+                self._set_status(f"Screenshot saved: {path}")
             except Exception as exc:
-                self._restore_screenshot_backgrounds()
                 self._set_status(f"Screenshot failed: {exc}")
+            finally:
+                self._restore_screenshot_backgrounds()
 
-        def _on_screenshot_done(self, path: str):
-            def save_image(image):
-                try:
-                    o3d.io.write_image(path, image, 9)
-                    self._set_status(f"Screenshot saved: {path}")
-                except Exception as exc:
-                    self._set_status(f"Screenshot failed: {exc}")
-                finally:
-                    self._restore_screenshot_backgrounds()
-
-            return save_image
+        def _on_screenshot_scale(self, value: float):
+            self._screenshot_scale = min(4.0, max(1.0, float(value)))
+            self._screenshot_scale_edit.double_value = self._screenshot_scale
+            self._set_status(f"Screenshot scale: {self._screenshot_scale:g}x")
 
         def _restore_screenshot_backgrounds(self):
             if not self._screenshot_was_pending:
@@ -835,10 +987,18 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
                     pane["scene"].add_geometry(name, geom, material)
 
                 if self._show_axis.checked:
-                    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0])
-                    axis.transform(self._axis_transform)
+                    axis_style = self._axis_style.selected_text
+                    axis = create_axis_marker(
+                        axis_style,
+                        size=1.0,
+                        transform=self._axis_transform,
+                    )
                     material = rendering.MaterialRecord()
-                    material.shader = "defaultUnlit"
+                    configure_axis_marker_material(
+                        material,
+                        axis_style,
+                        line_width=self._camera_line_width,
+                    )
                     pane["scene"].add_geometry(pane["axis_name"], axis, material)
 
                 bbox = combined_bbox(positioned)
@@ -886,6 +1046,16 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
 
         def _on_axis_toggle(self, _is_checked):
             self._rebuild_scene()
+
+        def _on_axis_style_changed(self, _text, _index):
+            self._rebuild_scene()
+
+        def _on_camera_line_width(self, value):
+            self._camera_line_width = clamp_camera_line_width(value)
+            self._camera_line_width_slider.double_value = self._camera_line_width
+            self._set_status(f"Camera line width: {self._camera_line_width:g}")
+            if self._axis_style.selected_text == "Camera" and self._show_axis.checked:
+                self._rebuild_scene()
 
         def _on_preserve_coordinates(self, is_checked):
             self._preserve_coordinates = bool(is_checked)

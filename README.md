@@ -27,6 +27,11 @@ pip install -r requirements.txt
 ```
 
 ## Usage
+One-click launcher on Windows:
+```
+start_3d_visualizer.bat
+```
+
 Start launcher (drag & drop):
 ```
 python pcd_viewer_app.py
@@ -42,7 +47,10 @@ python pcd_viewer_app.py --viewer --file A.ply --file B.glb --file C.bin
 - **Manual layout**: disable Auto layout and set rows/cols.
 - **Categories**: uncheck categories to hide them from the current render.
 - **Screenshot PNG**: saves the current view to `render_YYYYMMDD_HHMMSS.png` in the current working directory.
+- **Screenshot Scale**: renders screenshots at 1x-4x window resolution; default is 2x for sharper images.
 - **Preserve Coordinates**: keep the point cloud in its original frame so the axis origin remains the camera origin.
+- **Axis Style**: switch between the default coordinate axis and a thick, multi-color wireframe camera frustum pointing along +X.
+- **Camera Line Width**: adjust the wireframe camera line thickness from 1 to 12.
 - **Hide panel**: click "Hide Panel (H)" or press **H**.
 
 ## Build EXE (Windows)
