@@ -13,7 +13,7 @@ Open3D-based 3D point cloud visualizer with a single-window multi-pane layout an
 - Optional **Preserve Coordinates** mode so the displayed origin stays aligned with the original camera frame.
 - Shows **point count** for each loaded file.
 - Drag-and-drop launcher (TkinterDnD2) and file dialog with last-used directory.
-- Panel can be hidden/shown with **H**.
+- Panel can be hidden/shown with side arrow tabs or **H**.
 
 ## Requirements
 - Python 3.8+ (recommended)
@@ -27,6 +27,11 @@ pip install -r requirements.txt
 ```
 
 ## Usage
+One-click launcher on macOS/Linux:
+```
+sh start_3d_visualizer.sh
+```
+
 One-click launcher on Windows:
 ```
 start_3d_visualizer.bat
@@ -51,7 +56,16 @@ python pcd_viewer_app.py --viewer --file A.ply --file B.glb --file C.bin
 - **Preserve Coordinates**: keep the point cloud in its original frame so the axis origin remains the camera origin.
 - **Axis Style**: switch between the default coordinate axis and a thick, multi-color wireframe camera frustum pointing along +X.
 - **Camera Line Width**: adjust the wireframe camera line thickness from 1 to 12.
-- **Hide panel**: click "Hide Panel (H)" or press **H**.
+- **Hide panel**: click the `>` tab at the panel edge or press **H**. Click the `<` tab on the right edge to restore it.
+
+## Project Structure
+- `pcd_viewer_app.py`: thin compatibility entry point used by the launchers and PyInstaller.
+- `visualizer3d/cli.py`: command-line parsing and app mode selection.
+- `visualizer3d/viewer.py`: Open3D viewer window and panel callbacks.
+- `visualizer3d/launcher.py`: TkinterDnD drag-and-drop launcher.
+- `visualizer3d/assets.py` and `visualizer3d/semantics.py`: 3D file loading and semantic mesh splitting.
+- `visualizer3d/geometry.py`, `visualizer3d/scene.py`, `visualizer3d/screenshots.py`, `visualizer3d/ui_layout.py`: reusable viewer helpers.
+- `start_3d_visualizer.bat`: Windows launcher. The old misspelled `visiual_.bat` redirect was removed.
 
 ## Build EXE (Windows)
 ```

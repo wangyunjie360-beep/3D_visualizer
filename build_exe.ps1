@@ -7,5 +7,6 @@ pyinstaller pcd_viewer_app.py `
   --name PointCloudViewer `
   --onedir `
   --clean `
+  --collect-all visualizer3d `
   --collect-all open3d `
   --collect-all tkinterdnd2

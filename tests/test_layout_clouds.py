@@ -1,7 +1,10 @@
 import importlib
+import inspect
+from pathlib import Path
 import sys
 import types
 import unittest
+from tempfile import NamedTemporaryFile
 
 import numpy as np
 
@@ -9,6 +12,12 @@ import numpy as np
 class _FakeBoundingBox:
     def __init__(self, points):
         self._points = np.asarray(points, dtype=float)
+
+    def is_empty(self):
+        return len(self._points) == 0
+
+    def get_center(self):
+        return self._points.mean(axis=0)
 
     def get_extent(self):
         return self.get_max_bound() - self.get_min_bound()
@@ -168,6 +177,23 @@ class LayoutCloudsTests(unittest.TestCase):
         self.assertEqual(preferred_render_mode_for_path("foo.gltf"), "Mesh")
         self.assertEqual(preferred_render_mode_for_path("foo.ply"), "Points")
 
+    def test_load_bin_as_pcd_normalizes_intensity_with_numpy_2(self):
+        rows = np.array(
+            [
+                [1.0, 2.0, 3.0, 0.0],
+                [4.0, 5.0, 6.0, 10.0],
+            ],
+            dtype=np.float32,
+        )
+
+        with NamedTemporaryFile(suffix=".bin") as file:
+            rows.tofile(file.name)
+
+            cloud = app_module.load_bin_as_pcd(file.name)
+
+        np.testing.assert_allclose(cloud.points, rows[:, :3])
+        np.testing.assert_allclose(cloud.colors, [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
+
     def test_load_glb_returns_named_category_parts(self):
         parts = app_module.load_asset_parts("scene.glb", use_cuda=False)
 
@@ -216,6 +242,198 @@ class LayoutCloudsTests(unittest.TestCase):
 
         self.assertEqual(image, "image")
         self.assertEqual(app.calls, [("scene", 640, 480)])
+
+    def test_panel_width_only_reserves_space_when_visible(self):
+        self.assertEqual(app_module.panel_width_for_visibility(True, 14), 336)
+        self.assertEqual(app_module.panel_width_for_visibility(False, 14), 0)
+
+    def test_restore_tab_sits_on_right_edge_middle_when_panel_hidden(self):
+        rect = app_module.panel_restore_tab_frame(
+            content_x=10,
+            content_y=20,
+            content_width=800,
+            content_height=600,
+            font_size=14,
+            panel_visible=False,
+        )
+
+        self.assertEqual(rect, (779, 276, 31, 88))
+
+    def test_hide_tab_sits_on_panel_left_edge_middle_when_panel_visible(self):
+        rect = app_module.panel_hide_tab_frame(
+            content_x=10,
+            content_y=20,
+            content_width=800,
+            content_height=600,
+            panel_width=336,
+            font_size=14,
+            panel_visible=True,
+        )
+
+        self.assertEqual(rect, (443, 276, 31, 88))
+
+    def test_restore_tab_is_hidden_when_panel_visible(self):
+        self.assertIsNone(
+            app_module.panel_restore_tab_frame(
+                content_x=10,
+                content_y=20,
+                content_width=800,
+                content_height=600,
+                font_size=14,
+                panel_visible=True,
+            )
+        )
+
+    def test_panel_arrow_labels_match_visibility_direction(self):
+        self.assertEqual(app_module.panel_toggle_label(True), ">")
+        self.assertEqual(app_module.panel_toggle_label(False), "<")
+
+    def test_set_pane_background_syncs_scene_and_widget_color(self):
+        class FakeScene:
+            def __init__(self):
+                self.backgrounds = []
+                self.skybox_states = []
+
+            def set_background(self, color):
+                self.backgrounds.append(list(color))
+
+            def show_skybox(self, enabled):
+                self.skybox_states.append(enabled)
+
+        class FakeWidget:
+            def __init__(self):
+                self.background_color = None
+                self.redraws = 0
+
+            def force_redraw(self):
+                self.redraws += 1
+
+        class FakeColor:
+            def __init__(self, r, g, b, a):
+                self.values = (r, g, b, a)
+
+        pane = {
+            "scene": FakeScene(),
+            "widget": FakeWidget(),
+            "gui_color": FakeColor,
+        }
+
+        app_module.set_pane_background(pane, [0.1, 0.2, 0.3, 1.0])
+
+        self.assertEqual(pane["background"], [0.1, 0.2, 0.3, 1.0])
+        self.assertEqual(pane["scene"].backgrounds, [[0.1, 0.2, 0.3, 1.0]])
+        self.assertEqual(pane["scene"].skybox_states, [False])
+        self.assertEqual(pane["widget"].background_color.values, (0.1, 0.2, 0.3, 1.0))
+        self.assertEqual(pane["widget"].redraws, 1)
+
+    def test_panel_overlay_controls_are_installed_after_panes_for_z_order(self):
+        source = inspect.getsource(app_module.launch_viewer)
+
+        self.assertLess(
+            source.index("self._apply_layout(rebuild=True)"),
+            source.index("self._install_panel_overlay_controls()"),
+        )
+
+    def test_panel_container_is_installed_after_panes_for_z_order(self):
+        source = inspect.getsource(app_module.launch_viewer)
+
+        self.assertLess(
+            source.index("self._apply_layout(rebuild=True)"),
+            source.index("self._install_panel_container()"),
+        )
+
+    def test_scene_widget_interaction_disables_cache_and_redraws_on_drag(self):
+        class FakeWidget:
+            def __init__(self):
+                self.cache_states = []
+                self.mouse_callback = None
+                self.redraws = 0
+
+            def enable_scene_caching(self, enabled):
+                self.cache_states.append(enabled)
+
+            def set_on_mouse(self, callback):
+                self.mouse_callback = callback
+
+            def force_redraw(self):
+                self.redraws += 1
+
+        event_types = types.SimpleNamespace(DRAG="drag", MOVE="move")
+        callback_result = types.SimpleNamespace(IGNORED="ignored")
+        widget = FakeWidget()
+
+        app_module.configure_scene_widget_interaction(widget, event_types, callback_result)
+
+        self.assertEqual(widget.cache_states, [False])
+        self.assertIsNotNone(widget.mouse_callback)
+        self.assertEqual(widget.mouse_callback(types.SimpleNamespace(type="move")), "ignored")
+        self.assertEqual(widget.redraws, 0)
+        self.assertEqual(widget.mouse_callback(types.SimpleNamespace(type="drag")), "ignored")
+        self.assertEqual(widget.redraws, 1)
+
+    def test_legacy_entrypoint_is_thin_wrapper(self):
+        source_path = Path(app_module.__file__)
+        source = source_path.read_text(encoding="utf-8")
+
+        self.assertEqual(source_path.name, "pcd_viewer_app.py")
+        self.assertLessEqual(len(source.splitlines()), 80)
+        self.assertIn("from visualizer3d.cli import main", source)
+
+    def test_selected_listbox_paths_returns_selected_files(self):
+        class FakeListbox:
+            def __init__(self):
+                self.items = ["/tmp/a.ply", "/tmp/b.glb", "/tmp/c.bin"]
+
+            def curselection(self):
+                return (0, 2)
+
+            def get(self, index):
+                return self.items[index]
+
+        paths = app_module.selected_listbox_paths(FakeListbox())
+
+        self.assertEqual(paths, ["/tmp/a.ply", "/tmp/c.bin"])
+
+    def test_render_parameter_rebuilds_preserve_camera(self):
+        self.assertFalse(app_module.should_reset_camera_for_rebuild("point_size"))
+        self.assertFalse(app_module.should_reset_camera_for_rebuild("voxel_size"))
+        self.assertFalse(app_module.should_reset_camera_for_rebuild("axis"))
+        self.assertTrue(app_module.should_reset_camera_for_rebuild("scene"))
+
+    def test_maybe_setup_camera_skips_when_preserving_camera(self):
+        class FakeWidget:
+            def __init__(self):
+                self.calls = []
+
+            def setup_camera(self, *args):
+                self.calls.append(args)
+
+        widget = FakeWidget()
+        bbox = _FakeBoundingBox([[0, 0, 0], [2, 4, 6]])
+
+        did_setup = app_module.maybe_setup_camera(widget, bbox, reset_camera=False)
+
+        self.assertFalse(did_setup)
+        self.assertEqual(widget.calls, [])
+
+    def test_maybe_setup_camera_resets_camera_when_requested(self):
+        class FakeWidget:
+            def __init__(self):
+                self.calls = []
+
+            def setup_camera(self, *args):
+                self.calls.append(args)
+
+        widget = FakeWidget()
+        bbox = _FakeBoundingBox([[0, 0, 0], [2, 4, 6]])
+
+        did_setup = app_module.maybe_setup_camera(widget, bbox, reset_camera=True)
+
+        self.assertTrue(did_setup)
+        self.assertEqual(len(widget.calls), 1)
+        self.assertEqual(widget.calls[0][0], 60.0)
+        self.assertIs(widget.calls[0][1], bbox)
+        np.testing.assert_allclose(widget.calls[0][2], [1, 2, 3])
 
     def test_screenshot_render_size_clamps_invalid_dimensions(self):
         self.assertEqual(app_module.screenshot_render_size(0, -2, 2.0), (1, 1))
