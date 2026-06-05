@@ -287,11 +287,7 @@ def launch_viewer(file_paths, title: str, device_pref: str) -> None:
             while len(self._panes) < count:
                 widget = gui.SceneWidget()
                 widget.scene = rendering.Open3DScene(self._window.renderer)
-                configure_scene_widget_interaction(
-                    widget,
-                    gui.MouseEvent.Type,
-                    gui.Widget.EventCallbackResult,
-                )
+                configure_scene_widget_interaction(widget)
                 self._window.add_child(widget)
                 pane = {
                     "widget": widget,

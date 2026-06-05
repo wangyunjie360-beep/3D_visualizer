@@ -342,7 +342,7 @@ class LayoutCloudsTests(unittest.TestCase):
             source.index("self._install_panel_container()"),
         )
 
-    def test_scene_widget_interaction_disables_cache_and_redraws_on_drag(self):
+    def test_scene_widget_interaction_preserves_default_mouse_controls(self):
         class FakeWidget:
             def __init__(self):
                 self.cache_states = []
@@ -358,18 +358,13 @@ class LayoutCloudsTests(unittest.TestCase):
             def force_redraw(self):
                 self.redraws += 1
 
-        event_types = types.SimpleNamespace(DRAG="drag", MOVE="move")
-        callback_result = types.SimpleNamespace(IGNORED="ignored")
         widget = FakeWidget()
 
-        app_module.configure_scene_widget_interaction(widget, event_types, callback_result)
+        app_module.configure_scene_widget_interaction(widget)
 
         self.assertEqual(widget.cache_states, [False])
-        self.assertIsNotNone(widget.mouse_callback)
-        self.assertEqual(widget.mouse_callback(types.SimpleNamespace(type="move")), "ignored")
+        self.assertIsNone(widget.mouse_callback)
         self.assertEqual(widget.redraws, 0)
-        self.assertEqual(widget.mouse_callback(types.SimpleNamespace(type="drag")), "ignored")
-        self.assertEqual(widget.redraws, 1)
 
     def test_legacy_entrypoint_is_thin_wrapper(self):
         source_path = Path(app_module.__file__)

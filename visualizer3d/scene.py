@@ -25,13 +25,6 @@ def set_pane_background(pane, color) -> None:
         pane["widget"].force_redraw()
 
 
-def configure_scene_widget_interaction(widget, mouse_event_type, callback_result) -> None:
+def configure_scene_widget_interaction(widget) -> None:
     if hasattr(widget, "enable_scene_caching"):
         widget.enable_scene_caching(False)
-    if hasattr(widget, "set_on_mouse"):
-        def on_mouse(event):
-            if event.type == mouse_event_type.DRAG and hasattr(widget, "force_redraw"):
-                widget.force_redraw()
-            return callback_result.IGNORED
-
-        widget.set_on_mouse(on_mouse)
